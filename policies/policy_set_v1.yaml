@@ -1,0 +1,202 @@
+# ============================================================================
+# policy_set_v1.yaml
+# Policy-as-Code for the Governed Credit Limit Increase Agent (DA523)
+#
+# Evaluated by policy_engine.py using a DENY-OVERRIDES combining algorithm
+# (lineage: Cedar's forbid-overrides / XACML deny-overrides):
+#   1. ALL rules are evaluated (full trace is audit-logged).
+#   2. Any matched DENY            -> final effect DENY
+#   3. else any matched REQUIRE_HUMAN_REVIEW -> REQUIRE_HUMAN_REVIEW
+#   4. else any matched ALLOW      -> ALLOW
+#   5. else                        -> default_effect (fail-safe)
+#   * SUSPEND_AUTO_APPROVAL (P-06): while active, any ALLOW outcome is
+#     downgraded to REQUIRE_HUMAN_REVIEW.
+#
+# Conditions use a RESTRICTED expression grammar (comparisons, and/or/not,
+# in / not in, len()). They are AST-validated — never eval()'d.
+# Context namespaces: actor.*, customer.*, request.*, features.*,
+#                     model.*, decision.*, monitor.*, event.*
+# ============================================================================
+
+policy_set:
+  version: "1.0.0"
+  effective_date: "2026-07-01"
+  owner: "AI Governance Unit"
+  combining_algorithm: "deny_overrides"
+  default_effect: "REQUIRE_HUMAN_REVIEW"   # fail-safe: nothing auto-approves by omission
+
+policies:
+
+  # --------------------------------------------------------------------------
+  - id: "P-01"
+    name: "role_based_access_control"
+    concerns: [privacy, accountability]
+    description: >
+      Only authorised roles may initiate credit evaluations, and only within
+      their branch scope. Evaluated BEFORE any model call.
+    rules:
+      - rule: "P-01.1"
+        when: "actor.role not in ['loan_officer', 'senior_officer', 'admin']"
+        effect: "DENY"
+        reason: "Role '{actor.role}' is not authorised to run credit evaluations."
+      - rule: "P-01.2"
+        when: "customer.branch_code not in actor.branch_scope"
+        effect: "DENY"
+        reason: "Customer branch {customer.branch_code} is outside the actor's scope."
+
+  # --------------------------------------------------------------------------
+  - id: "P-02"
+    name: "data_minimisation_whitelist"
+    concerns: [privacy]
+    description: >
+      The scoring pipeline may consume only whitelisted fields. The context
+      builder computes features.non_whitelisted_count from the request's
+      actual field accesses; any violation blocks the evaluation.
+    allowed_fields:
+      - employment_type
+      - monthly_income_try
+      - monthly_obligations_try
+      - current_limit_try
+      - utilization_rate
+      - months_as_customer
+      - repayment_score
+      - num_late_payments_12m
+      - kkb_score_synthetic
+    rules:
+      - rule: "P-02.1"
+        when: "features.non_whitelisted_count > 0"
+        effect: "DENY"
+        reason: "Non-whitelisted field access attempted: {features.non_whitelisted_list}"
+
+  # --------------------------------------------------------------------------
+  - id: "P-03"
+    name: "protected_attribute_exclusion"
+    concerns: [fairness, non_compliance]
+    description: >
+      Protected attributes (gender, age) and the designated proxy
+      (region_code) are barred from model features. Protected attributes
+      live in a segregated audit store used solely for fairness
+      measurement (KVKK m.6 / GDPR Art. 9(2)(g)-style justification).
+    barred_features: [gender, age, region_code]
+    rules:
+      - rule: "P-03.1"
+        when: "model.barred_feature_count > 0"
+        effect: "DENY"
+        reason: "Model '{model.version}' includes barred feature(s): {model.barred_feature_list}"
+
+  # --------------------------------------------------------------------------
+  - id: "P-04"
+    name: "mandatory_explainability"
+    concerns: [transparency, ethics]
+    description: >
+      No decision may be released without machine-generated reason codes.
+      Adverse recommendations additionally require counterfactual guidance.
+    rules:
+      - rule: "P-04.1"
+        when: "decision.reason_code_count < 3"
+        effect: "DENY"
+        reason: "Explanation pipeline produced {decision.reason_code_count} reason codes (minimum 3)."
+      - rule: "P-04.2"
+        when: "model.recommendation == 'deny' and decision.has_counterfactual == false"
+        effect: "REQUIRE_HUMAN_REVIEW"
+        reason: "Adverse recommendation lacks counterfactual guidance; officer must review."
+
+  # --------------------------------------------------------------------------
+  - id: "P-05"
+    name: "tiered_human_oversight"
+    concerns: [human_oversight, accountability, non_compliance]
+    description: >
+      Implements GDPR Art. 22 / KVKK m.11-aligned human intervention:
+      solely automated adverse decisions are prohibited; high-risk cases
+      need senior, two-person review; hardship cases are never automated.
+      Rule order within this policy is protective-first, but the
+      deny-overrides algorithm makes the outcome order-independent.
+    rules:
+      - rule: "P-05.1"
+        when: "customer.hardship_flag == true"
+        effect: "REQUIRE_HUMAN_REVIEW"
+        reason: "Hardship-flagged customer; automated action is prohibited."
+        reviewer_role: "senior_officer"
+      - rule: "P-05.2"
+        when: "model.recommendation == 'deny'"
+        effect: "REQUIRE_HUMAN_REVIEW"
+        reason: "All adverse recommendations require officer confirmation (no solely automated denial)."
+        reviewer_role: "loan_officer"
+      - rule: "P-05.3"
+        when: "model.risk_band == 'HIGH' or request.increase_pct > 0.60"
+        effect: "REQUIRE_HUMAN_REVIEW"
+        reason: "High-risk case (band={model.risk_band}, increase={request.increase_pct}); senior two-person review."
+        reviewer_role: "senior_officer"
+        min_reviewers: 2
+      - rule: "P-05.4"
+        when: "model.risk_band == 'MEDIUM'"
+        effect: "REQUIRE_HUMAN_REVIEW"
+        reason: "Medium-risk case; standard officer review."
+        reviewer_role: "loan_officer"
+      - rule: "P-05.5"
+        when: "model.risk_band == 'LOW' and request.increase_pct <= 0.30 and model.recommendation == 'approve'"
+        effect: "ALLOW"
+        reason: "Low-risk auto-approval band; subject to 10% post-hoc sampled review."
+        post_controls: ["random_sample_review_10pct"]
+
+  # --------------------------------------------------------------------------
+  - id: "P-06"
+    name: "fairness_threshold_gate"
+    concerns: [fairness]
+    description: >
+      Batch monitor computes the disparate impact ratio (DIR) of approvals
+      across protected groups. Below 0.80 (four-fifths rule), system-wide
+      auto-approval is suspended: every ALLOW downgrades to human review
+      until investigation closes and the monitor clears.
+    metrics:
+      - name: "disparate_impact_ratio"
+        groups: [gender, age_band]
+        threshold: 0.80
+    rules:
+      - rule: "P-06.1"
+        when: "monitor.dir_min < 0.80"
+        effect: "SUSPEND_AUTO_APPROVAL"
+        reason: "Fairness gate breached (min DIR={monitor.dir_min} < 0.80); auto-approval suspended system-wide."
+
+  # --------------------------------------------------------------------------
+  - id: "P-07"
+    name: "appeal_and_contest"
+    concerns: [ethics, accountability]
+    description: >
+      Every adverse decision carries an appeal right. Appeals are reviewed
+      by a different officer than the original decision-maker within 48h.
+    rules:
+      - rule: "P-07.1"
+        when: "event.type == 'appeal'"
+        effect: "REQUIRE_HUMAN_REVIEW"
+        reason: "Customer appeal; independent review required within 48h."
+        reviewer_role: "loan_officer"
+        reviewer_constraint: "different_from_original"
+        sla_hours: 48
+
+  # --------------------------------------------------------------------------
+  - id: "P-08"
+    name: "audit_and_versioning"
+    concerns: [accountability, transparency, non_compliance]
+    description: >
+      Declarative logging contract enforced by the engine wrapper: every
+      decision event is appended to the hash-chained audit log with the
+      versions in force. Retention: 10 years (banking record-keeping).
+      This policy has no runtime rules; the engine refuses to emit a
+      decision object unless all required_log_fields are populated.
+    required_log_fields:
+      - event_id
+      - timestamp
+      - actor
+      - customer_pseudo_id
+      - request_id
+      - fields_accessed
+      - model_version
+      - policy_set_version
+      - policies_evaluated
+      - matched_rule
+      - effect
+      - reason_codes
+      - prev_hash
+      - entry_hash
+    rules: []
